@@ -246,11 +246,15 @@ class UiFrame(wx.Frame):
         self.alert.SetMessage(message)
         self.alert.ShowModal()
 
+    def set_yes_no_alert(self, title, message, proceed, stop):
+        self.dialog.SetTitle(title)
+        self.dialog.SetMessage(message)
+        self.dialog.SetYesNoLabels(proceed, stop)
+        return self.dialog.ShowModal() == wx.ID_YES
+
     def OnRead(self, event):
-        self.dialog.SetTitle("Load from EEPROM")
-        self.dialog.SetMessage("Replace current form with data read from EEPROM?")
-        self.dialog.SetYesNoLabels("Replace", "Cancel")
-        if self.dialog.ShowModal() != wx.ID_YES:
+        if not self.set_yes_no_alert("Load from EEPROM", "Replace current form with data read from EEPROM?",
+                                     "Replace", "Cancel"):
             return
 
         if func_connect_programmer():
@@ -278,22 +282,45 @@ class UiFrame(wx.Frame):
         self.lru_serial.set_value("")
         self.lru_mac.set_value("")
 
+    def validate_entry(self, title, element, max_length, required=False):
+        entry_string = element.get_value()
+        if required and len(entry_string) == 0:
+            self.SetStatusText("No " + title + " entered")
+
+        if len(entry_string) > max_length:
+            if self.set_yes_no_alert(title + " too long", "Entered " + title +
+                                                          " too long (Max " + str(max_length) + " characters). \n"
+                                                          + title + " MUST be be truncated", "Continue", "Cancel"):
+                entry_string = entry_string[:max_length]
+            else:
+                self.SetStatusText(title + " too long")
+                return False
+        return entry_string
+
     def OnWrite(self, event):
         # Load Part number string from Part number entry control. Truncate to allowable size.
-        assm_pn_string = self.part_number.get_value()[:dict_eeprom_data["PartNumber"]["size"]]
-        if len(assm_pn_string) == 0:
-            self.SetStatusText("No LRU entered")
-            return
+        pn_string = self.validate_entry("Part Number", self.part_number, dict_eeprom_data["PartNumber"]["size"],
+                                        required=True)
+        if pn_string is not False:
+            dict_eeprom_data["PartNumber"]["setValue"] = pn_string.encode("utf-8")
         else:
-            dict_eeprom_data["PartNumber"]["setValue"] = assm_pn_string.encode("utf-8")
+            return
+
+        # Load "BoardSerial" element from Board Serial entry control. Truncate to allowable size.
+        board_serial_string = self.validate_entry("Board Serial", self.board_serial,
+                                                  dict_eeprom_data["BoardSerial"]["size"], required=True)
+        if board_serial_string is not False:
+            dict_eeprom_data["BoardSerial"]["setValue"] = board_serial_string.encode("utf-8")
+        else:
+            return
 
         # Load "AssemblySerial" element from LRU Serial entry control. Truncate to allowable size.
-        assem_serial_string = self.board_serial.get_value()[:dict_eeprom_data["BoardSerial"]["size"]]
-        if len(assem_serial_string) == 0:
-            self.SetStatusText("No LRU Serial entered")
-            return
+        assm_serial_string = self.validate_entry("Lru Serial", self.lru_serial, dict_eeprom_data["LRUSerial"]["size"],
+                                                 required=False)
+        if assm_serial_string is not False:
+            dict_eeprom_data["LRUSerial"]["setValue"] = assm_serial_string.encode("utf-8")
         else:
-            dict_eeprom_data["BoardSerial"]["setValue"] = assem_serial_string.encode("utf-8")
+            dict_eeprom_data["LRUSerial"]["setValue"] = b''
 
         # Load MAC value string if provided and validate.
         mac_string = self.lru_mac.get_value()
@@ -311,20 +338,6 @@ class UiFrame(wx.Frame):
             func_program()
         else:
             self.set_alert("Write Error", "No Programmer detected")
-
-    def OnExit(self, event):
-        """Close the frame, terminating the application."""
-        self.Close(True)
-
-    def OnHello(self, event):
-        """Say hello to the user."""
-        wx.MessageBox("Hello World")
-
-    def OnAbout(self, event):
-        """Display an About Dialog"""
-        wx.MessageBox("This is a wxPython Hello World sample",
-                      "About Hello World 2",
-                      wx.OK|wx.ICON_INFORMATION)
 
     # Public setter function allowing external functions to set user messages to Status text bar
     def setStatusText(self, message):
@@ -345,17 +358,26 @@ def func_load_line(buffer, line_num):
 
 def func_connect_programmer():
     programmer_mode = 1  # E2M_COM = 1
-    programmer_file_type = 11  # E2_BIN = 9
+    programmer_file_type = 9  # E2_BIN = 9
     programmer_speed = 1  # SP_MEDIUM = 1
     sComPort = create_string_buffer(10)
-    sDevName = create_string_buffer(30)
+    ui_object.setStatusText("Connecting to Programmer")
 
-    if c_byte(lib.E2_GetNumPorts(programmer_mode)).value == 0:
-        return False
-    else:
-        lib.E2_GetPort(0, sComPort, programmer_mode)  # Get Com-port of connected device.
-        lib.E2_GetDevice(0, 17, sDevName)  # Get DevName of connected device.
-        return lib.E2_InitProgrammer(b'COM6', b'24C32', 1) == 0
+    num_ports = c_byte(lib.E2_GetNumPorts(programmer_mode)).value
+    for port_index in range(0, num_ports):
+        try:
+            lib.E2_GetPort(port_index, sComPort, programmer_mode)  # Get Com-port of connected device.
+            # Device name hardcoded for 24C32 (4KB flash) to avoid known issue with EEPROM programmer device flashing only
+            # Tail 4KB of binary in corrupt pattern if provided larger file size.
+            lib.E2_InitProgrammer(sComPort, b'24C32', 1)
+            if lib.E2_TestComms() == 0:
+                ui_object.setStatusText("Programmer Connected")
+                return True
+        except:
+            continue
+
+    ui_object.setStatusText("Disconnected")
+    return False
 
 
 def eeprom_write_buffer(eeprom_item, buffer_index):
